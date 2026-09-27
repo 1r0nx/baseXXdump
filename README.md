@@ -12,6 +12,8 @@ Scans a file for candidate encoded blobs — hex variants, baseXX strings, separ
 - **Binary family**: raw `0`/`1` strings, brute-forced across 7-bit and 8-bit chunking with all bit-offset skips
 - **Base family**: Base32 (standard / hex / Crockford), Base36, Base45, Base58 (Bitcoin / Flickr / Ripple), Base62, Base64 (standard / URL-safe / MIME), Base85 (Ascii85 delimited / plain / RFC1924), Base91, Base92
 - Filters candidates by printable-ratio, deduplicates identical decoded output, and can dump full untruncated results to JSON
+- **`--filter REGEX`** to show only decoded results matching a pattern (e.g. `CTF\{`) — the fastest way to cut brute-force noise
+- Reads from a **file, `-`, or a pipe** (stdin), for easy chaining in CTF workflows
 
 ## Requirements
 
@@ -21,7 +23,10 @@ Scans a file for candidate encoded blobs — hex variants, baseXX strings, separ
 ## Usage
 
 ```bash
-python3 baseXXdump.py <file> [options]
+python3 baseXXdump.py <file> [options]     # scan a file
+cat <file> | python3 baseXXdump.py         # read from stdin
+python3 baseXXdump.py - [options]           # stdin, explicit
+python3 baseXXdump.py -h                     # help
 ```
 
 ### Options
@@ -30,6 +35,7 @@ python3 baseXXdump.py <file> [options]
 |---|---|
 | `-e, --encoding` | Encoder, family (`hex`/`unicode`/`ascii`/`binary`/`base`), or `all` (default: `all`) |
 | `-E, --decoders` | Comma/semicolon-separated list of specific encoders to load (overrides `-e`) |
+| `-f, --filter` | Only show results whose decoded text matches this regex (e.g. `'CTF\{'`) |
 | `-u, --unique` | Do not repeat identical decoded output |
 | `--full` | Show full encoded/decoded strings instead of truncating to 60 chars |
 | `--minlen` | Minimum length of a candidate encoded string (default: 8) |
@@ -42,6 +48,12 @@ python3 baseXXdump.py <file> [options]
 ```bash
 # Scan everything, deduplicate identical results
 python3 baseXXdump.py firmware.bin -e all -u
+
+# Only show results that look like a flag (cuts brute-force noise)
+python3 baseXXdump.py dump.bin --filter 'CTF\{'
+
+# Read from stdin (chain with other tools)
+cat dump.bin | python3 baseXXdump.py --filter 'flag'
 
 # Only scan the hex family (zxbe/zxle/ah/bx/zxc/hex/pct)
 python3 baseXXdump.py dump.bin -e hex
@@ -69,5 +81,6 @@ python3 baseXXdump.py -l
 
 ## Notes
 
-- Broad-alphabet base decoders (`b58*`, `b62`, `b91`, `b92`) can overlap and produce false positives on dense binary data — this is expected brute-force scanner behavior, not a bug. Tune `--minlen` / `--mindecoded` to reduce noise.
+- Broad-alphabet base decoders (`b58*`, `b62`, `b91`, `b92`) can overlap and produce false positives on dense binary data — this is expected brute-force scanner behavior, not a bug. Use `--filter` to keep only results matching a pattern, or tune `--minlen` / `--mindecoded` to reduce noise.
+- Encoded blobs are found by scanning for maximal alphabet runs, so a blob sitting directly against noise bytes that share its alphabet can have its boundary corrupted. In practice blobs are usually delimited by whitespace or non-alphabet bytes; `test/file.bin` isolates each sample accordingly.
 - The `binary` family always emits 16 candidates per match (2 widths × 8 bit-offsets); only one is typically the correct decoding, the rest are noise by design.

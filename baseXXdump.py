@@ -30,13 +30,12 @@ TRUNC = 60
 # ─────────────────────────────────────────────
 
 def try_decode_bytes(raw: bytes) -> str:
-    """Attempt to decode raw bytes into a readable string."""
-    for enc in ("utf-8", "latin-1", "ascii"):
-        try:
-            return raw.decode(enc)
-        except Exception:
-            pass
-    return raw.hex()
+    """Decode raw bytes into a string: UTF-8 when valid, otherwise latin-1
+    (which maps every byte, so this never fails)."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
 
 
 def is_printable(s: str) -> bool:
@@ -409,8 +408,8 @@ def decode_zxc(s):
         return None
 
 
-def decode_zxbe(s):
-    """0x hexadecimal, big-endian, e.g. 0x909090900x77eb..."""
+def _decode_0x(s, little_endian):
+    """Decode a run of 0x hex tokens; reverse each token's bytes if little-endian."""
     tokens = re.findall(r"0[xX]([0-9A-Fa-f]{1,8})", s)
     if len(tokens) < 2:
         return None
@@ -419,26 +418,21 @@ def decode_zxbe(s):
         for t in tokens:
             if len(t) % 2:
                 t = "0" + t
-            raw += bytes.fromhex(t)
+            b = bytes.fromhex(t)
+            raw += b[::-1] if little_endian else b
         return try_decode_bytes(raw)
     except Exception:
         return None
+
+
+def decode_zxbe(s):
+    """0x hexadecimal, big-endian, e.g. 0x909090900x77eb..."""
+    return _decode_0x(s, little_endian=False)
 
 
 def decode_zxle(s):
     """0x hexadecimal, little-endian, e.g. 0x909090900xeb77..."""
-    tokens = re.findall(r"0[xX]([0-9A-Fa-f]{1,8})", s)
-    if len(tokens) < 2:
-        return None
-    try:
-        raw = b""
-        for t in tokens:
-            if len(t) % 2:
-                t = "0" + t
-            raw += bytes.fromhex(t)[::-1]
-        return try_decode_bytes(raw)
-    except Exception:
-        return None
+    return _decode_0x(s, little_endian=True)
 
 
 def decode_pct(s):
@@ -456,26 +450,25 @@ def decode_pct(s):
 # UNICODE FAMILY DECODERS
 # ─────────────────────────────────────────────
 
-def decode_bu(s):
-    r"""Backslash-u unicode, e.g. \u9090\ueb77..."""
-    tokens = re.findall(r"\\u([0-9A-Fa-f]{4})", s)
+def _decode_u(s, prefix):
+    """Decode a run of 4-hex-digit unicode tokens with the given prefix (\\u or %u)."""
+    tokens = re.findall(prefix + r"([0-9A-Fa-f]{4})", s)
     if len(tokens) < 2:
         return None
     try:
         return try_decode_bytes(bytes.fromhex("".join(tokens)))
     except Exception:
         return None
+
+
+def decode_bu(s):
+    r"""Backslash-u unicode, e.g. \u9090\ueb77..."""
+    return _decode_u(s, r"\\u")
 
 
 def decode_pu(s):
     """Percent-u unicode, e.g. %u9090%ueb77..."""
-    tokens = re.findall(r"%u([0-9A-Fa-f]{4})", s)
-    if len(tokens) < 2:
-        return None
-    try:
-        return try_decode_bytes(bytes.fromhex("".join(tokens)))
-    except Exception:
-        return None
+    return _decode_u(s, "%u")
 
 
 # ─────────────────────────────────────────────
@@ -631,17 +624,19 @@ def build_encoders(minlen):
     b92_class = _class_regex(b92_alpha, minlen)
     b45_class = _class_regex(BASE45_ALPHABET, minlen)
 
+    # NB: these use character RANGES (A-Z, 2-7, ...), so the regex is built
+    # directly — _class_regex() would re.escape the '-' and destroy the ranges.
     encoders["b32"] = {
         "family": "base", "desc": "Base32 standard (A-Z, 2-7)",
-        "regex": _class_regex("A-Z2-7=", minlen), "decode": decode_base32_standard,
+        "regex": re.compile(r"[A-Z2-7=]{%d,}" % minlen), "decode": decode_base32_standard,
     }
     encoders["b32hex"] = {
         "family": "base", "desc": "Base32 Hex (0-9, A-V)",
-        "regex": _class_regex("0-9A-Va-v=", minlen), "decode": decode_base32_hex,
+        "regex": re.compile(r"[0-9A-Va-v=]{%d,}" % minlen), "decode": decode_base32_hex,
     }
     encoders["b32crock"] = {
         "family": "base", "desc": "Base32 Crockford",
-        "regex": _class_regex("0-9A-Za-z", minlen), "decode": decode_base32_crockford,
+        "regex": re.compile(r"[0-9A-Za-z]{%d,}" % minlen), "decode": decode_base32_crockford,
     }
     encoders["b45"] = {
         "family": "base", "desc": "Base45 (RFC 9285)",
@@ -690,7 +685,9 @@ def build_encoders(minlen):
     }
     encoders["b85rfc"] = {
         "family": "base", "desc": "Base85 RFC1924 (Python btoa / ZeroMQ)",
-        "regex": _class_regex("0-9A-Za-z!#$%&()*+\\-;<=>?@^_`{|}~", minlen),
+        # ranges 0-9A-Za-z plus RFC1924 symbols; '-' kept last so it stays literal.
+        # Built by concatenation because the alphabet itself contains '%'.
+        "regex": re.compile("[0-9A-Za-z!#$%&()*+;<=>?@^_`{|}~-]{" + str(minlen) + ",}"),
         "decode": decode_base85_rfc1924,
     }
     encoders["b91"] = {
@@ -775,28 +772,60 @@ def select_encoders(all_encoders, encoding_arg, decoders_arg):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract and decode hex/baseXX/ascii/binary/unicode encoded data from a file.",
+        prog="baseXXdump.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Scan a file (or stdin) for encoded blobs and decode them.\n"
+            "Runs ~30 decoders across 5 families — hex, unicode, ascii, binary,\n"
+            "base — and prints every candidate that decodes to readable text."
+        ),
+        epilog=(
+            "examples:\n"
+            "  baseXXdump.py file.bin                     # try every decoder\n"
+            "  cat file.bin | baseXXdump.py               # read from stdin\n"
+            "  baseXXdump.py file.bin --filter 'CTF\\{'    # only results matching a regex\n"
+            "  baseXXdump.py file.bin -e base -u          # only base-N decoders, deduped\n"
+            "  baseXXdump.py file.bin -E b64,b32,hex      # only these three decoders\n"
+            "  baseXXdump.py file.bin --full --jsonoutput # full output + JSON dump\n"
+            "  baseXXdump.py -l                           # list all encoder names\n"
+        ),
     )
-    parser.add_argument("file", nargs="?", help="file to scan")
-    parser.add_argument("-e", "--encoding", default="all",
-                         help="encoder, family (hex/unicode/ascii/binary/base), or 'all' (default: all)")
-    parser.add_argument("-E", "--decoders", dest="decoders", default="",
-                         help="comma/semicolon separated list of encoders to load (overrides -e)")
+    parser.add_argument("file", nargs="?",
+                         help="file to scan; use '-' or pipe data for stdin")
+    parser.add_argument("-e", "--encoding", default="all", metavar="SEL",
+                         help="what to run: a family (hex/unicode/ascii/binary/base), "
+                              "a single encoder name, a comma/semicolon list, or 'all' "
+                              "(default: all)")
+    parser.add_argument("-E", "--decoders", dest="decoders", default="", metavar="LIST",
+                         help="explicit comma/semicolon list of encoder names to run "
+                              "(overrides -e); see -l for names")
+    parser.add_argument("-f", "--filter", dest="filter", default=None, metavar="REGEX",
+                         help="only show results whose decoded text matches this regex "
+                              "(e.g. 'CTF\\{' or 'flag') — the fastest way to cut noise")
     parser.add_argument("-u", "--unique", action="store_true",
-                         help="do not repeat identical decoded data")
+                         help="collapse duplicate decoded outputs (show each only once)")
     parser.add_argument("--full", action="store_true",
-                         help="show full encoded/decoded strings instead of truncating to 60 chars")
-    parser.add_argument("--minlen", type=int, default=8,
-                         help="minimum length of a candidate encoded string (default: 8)")
-    parser.add_argument("--mindecoded", type=int, default=3,
+                         help="print full encoded/decoded strings instead of truncating to 60 chars")
+    parser.add_argument("--minlen", type=int, default=8, metavar="N",
+                         help="minimum length of a candidate encoded blob to consider (default: 8)")
+    parser.add_argument("--mindecoded", type=int, default=3, metavar="N",
                          help="minimum length of decoded output to keep (default: 3)")
     parser.add_argument("--jsonoutput", nargs="?", const="__default__", default=None,
                          metavar="FILE",
-                         help="write full, untruncated results as JSON to FILE "
-                              "(default: <input>.baseXXdump.json)")
+                         help="also write full, untruncated results as JSON "
+                              "(FILE optional; default: <input>.baseXXdump.json)")
     parser.add_argument("-l", "--list", action="store_true",
-                         help="list available encoders and exit")
+                         help="list every available encoder with a description, then exit")
     args = parser.parse_args()
+
+    # Compile the output filter once (fail early on a bad regex).
+    filter_re = None
+    if args.filter is not None:
+        try:
+            filter_re = re.compile(args.filter)
+        except re.error as exc:
+            cprint("red", f"  Error: invalid --filter regex: {exc}")
+            return 1
 
     all_encoders = build_encoders(args.minlen)
 
@@ -810,16 +839,21 @@ def main():
             print()
         return 0
 
-    if not args.file:
+    # Read the input: a file path, '-', or piped stdin.
+    if args.file and args.file != "-":
+        if not os.path.isfile(args.file):
+            cprint("red", f"  Error: file not found: {args.file}")
+            return 1
+        with open(args.file, "rb") as f:
+            raw = f.read()
+        display_name = args.file
+    elif args.file == "-" or not sys.stdin.isatty():
+        raw = sys.stdin.buffer.read()
+        display_name = "<stdin>"
+    else:
         parser.print_help()
         return 1
 
-    if not os.path.isfile(args.file):
-        cprint("red", f"  Error: file not found: {args.file}")
-        return 1
-
-    with open(args.file, "rb") as f:
-        raw = f.read()
     # latin-1 preserves a 1:1 byte<->char mapping so every regex sees all 256 byte values
     text = raw.decode("latin-1")
 
@@ -829,8 +863,10 @@ def main():
         return 1
 
     cprint("bold", f"\n{'═' * 70}")
-    cprint("cyan", f"  File    : {args.file}  ({len(raw)} bytes)")
+    cprint("cyan", f"  File    : {display_name}  ({len(raw)} bytes)")
     cprint("cyan", f"  Encoders: {', '.join(selected)}")
+    if filter_re is not None:
+        cprint("cyan", f"  Filter  : /{args.filter}/")
     cprint("bold", f"{'═' * 70}\n")
 
     all_results = []
@@ -843,6 +879,8 @@ def main():
     seen = set()
     shown = []
     for r in all_results:
+        if filter_re is not None and not filter_re.search(r["decoded"]):
+            continue
         if args.unique:
             if r["decoded"] in seen:
                 continue
@@ -862,7 +900,7 @@ def main():
     if args.jsonoutput is not None:
         out_path = args.jsonoutput
         if out_path == "__default__":
-            base = os.path.basename(args.file)
+            base = os.path.basename(args.file) if args.file and args.file != "-" else "stdin"
             out_path = f"{base}.baseXXdump.json"
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(shown, f, indent=2, ensure_ascii=False)
